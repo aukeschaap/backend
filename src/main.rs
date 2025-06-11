@@ -13,8 +13,10 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer()) // print logs to stdout
         .init();
 
+    // Initialize system information
     let sys = Arc::new(Mutex::new(System::new_all()));
-    let state = server::state::AppState { sys };
+    let disks = Arc::new(Mutex::new(sysinfo::Disks::new_with_refreshed_list()));
+    let state = server::state::SystemState { sys, disks };
 
     let app = Router::new()
         .nest("/server", server::routes::routes())
