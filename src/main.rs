@@ -1,4 +1,7 @@
-use axum::{Router};
+use axum::{Extension, Router};
+use std::sync::Arc;
+use sysinfo::System;
+use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod server;
@@ -10,12 +13,19 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer()) // print logs to stdout
         .init();
 
-    let app = Router::new()
-        .nest("/server", server::routes::routes());
+    let sys = Arc::new(Mutex::new(System::new_all()));
+    let state = server::state::AppState { sys };
 
-    // run our app with hyper, listening globally on port 3000
+    let app = Router::new()
+        .nest("/server", server::routes::routes())
+        .layer(Extension(state));
+
+    // run app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 
-    println!("Server running on http://{}...", listener.local_addr().unwrap());
+    println!(
+        "Server running on http://{}...",
+        listener.local_addr().unwrap()
+    );
     axum::serve(listener, app).await.unwrap();
 }
