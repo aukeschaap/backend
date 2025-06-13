@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the complete architecture for a secure, modular, and extensible backend system running on a single server using [k3s](https://k3s.io/). The system is composed of various pods for authentication, routing, administrative control, background jobs, and monitoring. It supports multiple environments (production, nightly testing, and development) for safe and flexible deployment.
+This document describes the complete architecture for a secure, modular, and extensible backend system running on a single server using [k3s](https://k3s.io/). The system is composed of various pods for authentication, routing, administrative control, background jobs, persistent logging, and monitoring. It supports multiple environments (production, nightly testing, and development) for safe and flexible deployment.
 
 ---
 
@@ -12,22 +12,29 @@ This document describes the complete architecture for a secure, modular, and ext
 * Securely expose only the authentication gateway.
 * Provide an admin API to manage deployment operations like `kubectl apply`, rollouts, and rollbacks.
 * Run background jobs (e.g. health checks) in a controlled and isolated way.
+* Log job metadata persistently to survive reboots and crashes.
 * Support distinct environments for production, nightly testing, and development.
 
 ---
 
 ## High-Level Architecture 🧱
 
-### Core Pods
+### Core Pods (Per Environment)
 
-| Pod / Component       | Purpose                                                                    | Access Scope                  |
-| --------------------- | -------------------------------------------------------------------------- | ----------------------------- |
-| **Gateway Pod**       | Handles OAuth2 login, JWT issuance, and routes requests to services.       | Public via Ingress            |
-| **Admin Pod**         | Provides internal `/admin` API for safe execution of `kubectl` operations. | via Gateway (authorized)      |
-| **Job/Scheduler Pod** | Executes background jobs, health checks, and action proposal workflows.    | via Gateway                   |
-| **Monitoring Pod**    | Exposes CPU, disk, and other metrics from the host (read-only).            | via Gateway                   |
-| **Dashboard**         | Frontend interface for system and service monitoring.                      | Public (authenticated)        |
-| **Microservices**     | Business logic services; separated by function.                            | via Gateway                   |
+
+| Pod / Component       | Purpose                                                                    | Exposure             | Persistent?  |
+| --------------------- | -------------------------------------------------------------------------- | -------------------- | ------------ |
+| **Gateway Pod**       | Handles OAuth2 login, JWT issuance, and routes requests to services.       | Public via Ingress   | ❌            |
+| **Gateway DB Pod**    | Local database storing user roles/rights per environment.                  | Internal only        | ✅ PVC        |
+| **Admin Pod**         | Provides internal `/admin` API for safe execution of `kubectl` operations. | Internal only        | ❌            |
+| **Job/Scheduler Pod** | Executes background jobs, health checks, and action proposal workflows.    | Internal only        | ❌            |
+| **Logging DB Pod**    | Central database storing job metadata and log entries.                     | Internal only        | ✅ PVC        |
+| **Monitoring Pod**    | Exposes CPU, disk, and other metrics from the host (read-only).            | Internal only        | ❌            |
+| **Data Platform Pod** | Shared persistent database or data lake for all services.                  | Internal only        | ✅ PVC        |
+| **Secret Store Pod**  | Optional: Centralized secret management (e.g. Vault).                      | Internal only        | ✅ (optional) |
+| **Microservices**     | Business logic services; separated by function.                            | Internal only        | Varies       |
+
+
 
 ---
 
@@ -40,14 +47,16 @@ This document describes the complete architecture for a secure, modular, and ext
 [ Ingress Controller (Nginx) ]
      │
      ▼
-[ Gateway Pod ]  ◄─────┐
-     │                 │
-     │                 │
-     ├──► [ Dashboard Pod ]
-     ├──► [ Microservices ]
-     ├──► [ Monitoring Pod ]
+[ Gateway Pod ] ──► [ Gateway DB Pod ]
      │
-     └──► [ Admin Pod (internal only) ] ◄── [ Job/Scheduler Pod ]
+     │
+     ├──► [ Monitoring Pod ]   ──► [ Logging DB Pod ]
+     ├──► [ Data Platform Pod ]            ▲
+     ├──► [ Job/Scheduler Pod ]          ──┤
+     ├──► [ Admin Pod]                   ──┘
+     ├──► [ Secret Store Pod ]
+     |
+     └──► [ Microservices ]
 
 [ SSH Access ] ──► [ Host System ]
 ```
@@ -56,18 +65,18 @@ This document describes the complete architecture for a secure, modular, and ext
 
 ## Exposed Endpoints 🔓
 
-| Endpoint                                | Purpose                    | Auth Required?  | Access Scope  |
-| --------------------------------------- | -------------------------- | --------------- | ------------- |
-| `https://gateway.example.com`           | OAuth2 login, JWT issuance | Token based     | Exposed        |
-| `https://gateway.example.com/api`       | Routed service calls       | ❌ No          | Internal only |
-| `https://gateway.example.com/monitor`   | View host/pod metrics      | ❌ No          | Internal only |
-| `https://gateway.example.com/dashboard` | Frontend dashboard         | ❌ No          | Internal only |
-| `/admin/*` (Admin Pod)                  | Apply, restart, rollback   | ❌ No          | Internal only |
-| SSH                                     | Manual host access         | Key based       | Exposed      |
+| Endpoint                                | Purpose                    | Access Scope  | Auth method    |
+| --------------------------------------- | -------------------------- | ------------- | -------------- |
+| `https://gateway.example.com`           | OAuth2 login, JWT issuance | ⚠️ Direct     | Token based   |
+| `/monitor/*` (Monitoring Pod)           | System metrics             | via Gateway   | RBAC           |
+| `/admin/*` (Admin Pod)                  | Apply, restart, rollback   | via Gateway   | RBAC           |
+| `/jobs/*` (Job/Scheduler Pod)           | Background job management  | via Gateway   | RBAC           |
+| `/data/*` (Data Platform Pod)           | Access data lake/warehouse | via Gateway   | RBAC           |
+| SSH                                     | Manual host access         | ⚠️ Direct     | Key based     |
 
 ---
 
-## Routing and Exposure 🛰️
+## Routing and Exposure 🚀
 
 ### Ingress Design
 
@@ -85,17 +94,17 @@ This document describes the complete architecture for a secure, modular, and ext
   * OAuth2 login and token issuance
   * JWT verification
   * Routing to allowed internal services
-* Does **not** include any `/admin` functionality.
+* Enforces **custom application-level RBAC**
 
 ### Admin Pod
 
-* Exposes internal-only `/admin/...` endpoints
-* Can execute:
+* Exposes `/admin/...` endpoints
+* Executes:
 
   * `kubectl apply`
   * `kubectl rollout restart`
   * `kubectl rollout undo`
-* Requires admin JWT scope
+* Requires **admin JWT scope**
 * Designed to handle administrative control safely and securely
 
 ### Job/Scheduler Pod
@@ -103,8 +112,14 @@ This document describes the complete architecture for a secure, modular, and ext
 * Runs background jobs such as:
 
   * Checking pod health (e.g., CrashLoopBackOff detection)
-  * Submitting action requests to Admin Pod
-* Does not execute admin actions directly — instead, it proposes them for review and consent
+  * Submitting job records to Logging DB
+  * Proposing actions to Admin Pod
+
+### Logging DB Pod
+
+* Central persistent database (e.g., Postgres or Mongo)
+* Stores job submissions, statuses, and results
+* Survives crashes and system reboots
 
 ### Monitoring Pod
 
@@ -112,27 +127,38 @@ This document describes the complete architecture for a secure, modular, and ext
 * Reports system-level metrics like CPU, RAM, disk usage
 * Called by Dashboard or Gateway to provide observability
 
+### Data Platform Pod
+
+* Central data lake or warehouse for business or analytic data
+* Used by Microservices or external tools
+* Persistent with automated backups (optional)
+
 ---
 
-## Recovery and Failover 🔁
+## Recovery and Failover ♻️
 
 ### Pod Crash
 
-* Kubernetes will restart pods on failure automatically
-* If a rollout deploys faulty code, pods enter `CrashLoopBackOff`
-* Admin Pod can be used to trigger `kubectl rollout undo`
+* Kubernetes automatically restarts failed pods
+* Faulty rollouts enter `CrashLoopBackOff`
+* Admin Pod supports `kubectl rollout undo`
 
 ### Gateway Crash
 
-* Manual SSH access is used to rollback via `kubectl` if Gateway fails
-* Gateway protected by Kubernetes liveness and readiness probes
-* Future enhancement: a watchdog Job Pod that proposes rollback automatically if Gateway fails health checks
+* Liveness/readiness probes provide self-healing
+* SSH fallback to rollback Gateway manually
+* Optionally monitored by Scheduler Pod
+
+### Persistent Logging
+
+* Job/scheduler logs are written to the **Logging DB**, not ephemeral logs
+* Ensures traceability of job status after restarts or outages
 
 ### Manual Recovery
 
 * Always available via SSH
 * `k3s` auto-starts on reboot via systemd
-* Backup YAML manifests for critical components like Gateway can be stored on disk (e.g. `/opt/k8s-backups/...`)
+* Backup YAML manifests stored on disk (`/opt/k8s-backups/...`)
 
 ---
 
@@ -154,12 +180,12 @@ This document describes the complete architecture for a secure, modular, and ext
   * `gateway.example.com` → prod
   * `nightly.gateway.example.com` → nightly
   * `dev.gateway.example.com` → dev
-* ConfigMaps, Secrets, Services, Deployments are namespace-scoped
-* RBAC permissions can be defined per namespace for added isolation
+* ConfigMaps, Secrets, PVCs, Services, Deployments are namespace-scoped
+* RBAC permissions are defined per namespace for security and isolation
 
 ### Deployment Strategy
 
-* Admin Pod can target specific environments via namespace input
+* Admin Pod targets specific namespaces via API input
 * `kubectl -n <env> apply -f ...` used for CLI or API-based deployments
 * GitOps compatible (Flux/Argo optional)
 
@@ -168,10 +194,13 @@ This document describes the complete architecture for a secure, modular, and ext
 ## Security Practices 🔒
 
 * All exposed services go through the Gateway with OAuth2 and JWT
-* Microservices and Admin APIs are **never exposed directly** to the public
+* Application-level RBAC enforced by Gateway via user roles
+* Microservices, Admin APIs, and internal DBs are **never exposed directly**
+* Logging DB is protected with Secrets and Kubernetes RBAC
 * Monitoring pod is read-only
-* SSH access is tightly restricted and key-auth only
-* Admin Pod actions require proper JWT scopes and (optionally) human approval
+* SSH access is restricted and key-auth only
+* Admin actions require elevated JWT scopes
+* Optional: NetworkPolicies restrict cross-namespace traffic
 
 ---
 
@@ -180,9 +209,10 @@ This document describes the complete architecture for a secure, modular, and ext
 This architecture enables:
 
 * Secure public access via a JWT-authenticated Gateway
-* Fine-grained control over deployments and rollouts via a dedicated Admin API
-* Safe background automation through a scheduler Job Pod
-* Full observability of host and pod health
-* Clear separation of environments within a single-node k3s setup
+* Application-level RBAC for custom access control
+* Persistent job logging and recovery
+* Safe administrative control via a dedicated Admin API
+* Self-healing and observable system components
+* Clear namespace isolation across environments
 
-This design is robust enough for production use, flexible enough for development and CI/CD, and minimal in terms of moving parts — perfect for a single-machine k3s deployment. 🔧
+This design is robust enough for production use, flexible enough for CI/CD and dev testing, and lightweight enough to run on a single-node k3s cluster. 💠
